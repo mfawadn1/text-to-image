@@ -14,9 +14,28 @@ st.set_page_config(
 
 # Title and description
 st.title("🎨 AI Text-to-Image Generator")
+
+# IMPORTANT: Check if running on Streamlit Cloud
+if not torch.cuda.is_available():
+    st.error("""
+    ⚠️ **IMPORTANT: No GPU Detected**
+    
+    This app is running on CPU which makes image generation **extremely slow** (5-10 minutes per image).
+    
+    **For fast local usage with GPU:**
+    1. Download this code to your local machine
+    2. Install requirements: `pip install -r requirements.txt`
+    3. Run locally: `streamlit run app.py`
+    4. Your NVIDIA Quadro P1000 will generate images in ~10-30 seconds
+    
+    **You can still try it here on CPU, but expect long wait times.**
+    """)
+    
+    st.markdown("---")
+
 st.markdown("""
 Generate beautiful images from text descriptions using Stable Diffusion.
-This app runs completely locally on your machine using open-source models.
+This app runs completely locally using open-source models.
 """)
 
 # Device selection
@@ -31,7 +50,8 @@ def get_device():
         st.sidebar.info(f"VRAM: {vram:.1f} GB")
     else:
         device = "cpu"
-        st.sidebar.warning("⚠️ No GPU detected. Using CPU (will be slower)")
+        st.sidebar.warning("⚠️ CPU Mode (Very Slow)")
+        st.sidebar.info("Download and run locally for GPU acceleration")
     return device
 
 device = get_device()
@@ -41,40 +61,71 @@ device = get_device()
 def load_model(model_name):
     """Load the Stable Diffusion model with caching"""
     try:
-        with st.spinner(f"🔄 Loading model: {model_name}... This may take a few minutes on first run."):
-            # Load pipeline with optimizations for limited VRAM
-            pipe = StableDiffusionPipeline.from_pretrained(
-                model_name,
-                torch_dtype=torch.float16 if device == "cuda" else torch.float32,
-                safety_checker=None,  # Disable for speed
-                requires_safety_checker=False
-            )
-            
-            pipe = pipe.to(device)
-            
-            # Enable memory efficient attention if on GPU
-            if device == "cuda":
-                pipe.enable_attention_slicing()
-            
-            st.sidebar.success("✅ Model loaded successfully!")
-            return pipe
+        progress_text = st.empty()
+        progress_bar = st.progress(0)
+        
+        progress_text.text("🔄 Downloading model files... (This happens only once, ~2-4 GB)")
+        progress_bar.progress(20)
+        
+        # Use smaller model for CPU, optimized for Streamlit Cloud
+        pipe = StableDiffusionPipeline.from_pretrained(
+            model_name,
+            torch_dtype=torch.float16 if device == "cuda" else torch.float32,
+            safety_checker=None,
+            requires_safety_checker=False,
+            low_cpu_mem_usage=True  # Important for CPU
+        )
+        
+        progress_bar.progress(60)
+        progress_text.text("🔄 Loading model to device...")
+        
+        pipe = pipe.to(device)
+        
+        # Enable optimizations
+        if device == "cuda":
+            pipe.enable_attention_slicing()
+        else:
+            # CPU optimizations
+            pipe.enable_attention_slicing(slice_size=1)
+        
+        progress_bar.progress(100)
+        progress_text.text("✅ Model loaded successfully!")
+        
+        # Clear progress indicators after 2 seconds
+        import time
+        time.sleep(2)
+        progress_text.empty()
+        progress_bar.empty()
+        
+        st.sidebar.success("✅ Model ready!")
+        return pipe
     except Exception as e:
         st.error(f"❌ Error loading model: {str(e)}")
+        st.info("Try refreshing the page or selecting a different model.")
         return None
 
 # Sidebar - Model selection
 st.sidebar.header("⚙️ Model Settings")
 
-model_options = {
-    "Stable Diffusion v1.5 (Recommended for 4GB VRAM)": "runwayml/stable-diffusion-v1-5",
-    "Stable Diffusion 2.1 Base (Better quality)": "stabilityai/stable-diffusion-2-1-base",
-    "Stable Diffusion v1.4 (Fastest)": "CompVis/stable-diffusion-v1-4"
-}
+# Only offer smaller, faster models for CPU/Streamlit Cloud
+if device == "cpu":
+    model_options = {
+        "Stable Diffusion v1.4 (Fastest, Recommended for CPU)": "CompVis/stable-diffusion-v1-4",
+        "Stable Diffusion v1.5": "runwayml/stable-diffusion-v1-5",
+    }
+    default_index = 0
+else:
+    model_options = {
+        "Stable Diffusion v1.5 (Recommended)": "runwayml/stable-diffusion-v1-5",
+        "Stable Diffusion 2.1 Base": "stabilityai/stable-diffusion-2-1-base",
+        "Stable Diffusion v1.4 (Fastest)": "CompVis/stable-diffusion-v1-4"
+    }
+    default_index = 0
 
 selected_model_name = st.sidebar.selectbox(
     "Choose Model",
     options=list(model_options.keys()),
-    index=0
+    index=default_index
 )
 
 model_id = model_options[selected_model_name]
@@ -85,13 +136,17 @@ pipe = load_model(model_id)
 # Sidebar - Generation parameters
 st.sidebar.header("🎛️ Generation Parameters")
 
+# Adjust defaults based on device
+default_steps = 15 if device == "cpu" else 30
+max_steps = 30 if device == "cpu" else 100
+
 num_inference_steps = st.sidebar.slider(
     "Inference Steps",
     min_value=10,
-    max_value=100,
-    value=30,
+    max_value=max_steps,
+    value=default_steps,
     step=5,
-    help="More steps = better quality but slower. 25-35 is a good balance."
+    help="More steps = better quality but MUCH slower on CPU. 15-20 recommended for CPU."
 )
 
 guidance_scale = st.sidebar.slider(
@@ -116,12 +171,19 @@ else:
         help="Set a specific seed for reproducible results"
     )
 
-# Image dimensions
-width = st.sidebar.selectbox("Width", [512, 768], index=0)
-height = st.sidebar.selectbox("Height", [512, 768], index=0)
+# Image dimensions - force 512x512 on CPU for speed
+if device == "cpu":
+    width = 512
+    height = 512
+    st.sidebar.info("📏 Resolution: 512x512 (optimal for CPU)")
+else:
+    width = st.sidebar.selectbox("Width", [512, 768], index=0)
+    height = st.sidebar.selectbox("Height", [512, 768], index=0)
 
-if width > 512 or height > 512:
-    st.sidebar.warning("⚠️ Larger images require more VRAM and may be slower")
+# Show estimated time
+if device == "cpu":
+    estimated_time = num_inference_steps * 15  # ~15 seconds per step on CPU
+    st.sidebar.warning(f"⏱️ Estimated time: ~{estimated_time//60} minutes {estimated_time%60} seconds")
 
 # Main interface - Prompt inputs
 col1, col2 = st.columns([2, 1])
@@ -130,25 +192,33 @@ with col1:
     prompt = st.text_area(
         "✍️ Describe the image you want to generate",
         height=100,
-        placeholder="Example: a beautiful sunset over mountains, digital art, highly detailed, trending on artstation",
+        placeholder="Example: a serene lake at sunset, mountains in background, oil painting style",
         help="Be descriptive! Include style, mood, and details."
     )
 
     negative_prompt = st.text_area(
         "🚫 Negative Prompt (what to avoid)",
         height=80,
-        value="blurry, bad quality, distorted, ugly, bad anatomy",
+        value="blurry, bad quality, distorted, ugly",
         help="Describe what you don't want in the image"
     )
 
 with col2:
     st.markdown("### 💡 Tips")
-    st.markdown("""
-    - Be specific and descriptive
-    - Add style keywords (e.g., "oil painting", "photorealistic", "anime style")
-    - Use quality boosters: "highly detailed", "8k", "masterpiece"
-    - Adjust steps: 20-30 for drafts, 40-50 for final images
-    """)
+    if device == "cpu":
+        st.markdown("""
+        - **Use 15-20 steps** for CPU
+        - Keep prompts simple
+        - Be patient - CPU is slow
+        - **Run locally with GPU** for fast results
+        """)
+    else:
+        st.markdown("""
+        - Be specific and descriptive
+        - Add style keywords
+        - Use quality boosters
+        - 25-35 steps for quality
+        """)
 
 # Generate button
 generate_button = st.button("🎨 Generate Image", type="primary", use_container_width=True)
@@ -161,16 +231,26 @@ if generate_button:
         st.error("❌ Model not loaded. Please refresh the page.")
     else:
         try:
-            # Clear GPU cache before generation
+            # CPU warning
+            if device == "cpu":
+                st.warning(f"⏳ Generating on CPU... This will take approximately {num_inference_steps * 15 // 60} minutes. Please be patient!")
+            
+            # Clear cache before generation
             if device == "cuda":
                 torch.cuda.empty_cache()
-                gc.collect()
+            gc.collect()
             
             # Set seed for reproducibility
             generator = torch.Generator(device=device).manual_seed(seed)
             
             # Generate image with progress
+            progress_placeholder = st.empty()
+            
             with st.spinner(f"🎨 Generating image... (Seed: {seed})"):
+                start_time = st.empty()
+                import time
+                start = time.time()
+                
                 image = pipe(
                     prompt=prompt,
                     negative_prompt=negative_prompt,
@@ -180,9 +260,11 @@ if generate_button:
                     height=height,
                     generator=generator
                 ).images[0]
+                
+                elapsed = time.time() - start
             
             # Display the generated image
-            st.success("✅ Image generated successfully!")
+            st.success(f"✅ Image generated successfully in {elapsed:.1f} seconds!")
             
             # Show image in a nice container
             st.image(image, caption=f"Generated Image | Seed: {seed}", use_container_width=True)
@@ -211,28 +293,26 @@ if generate_button:
                 st.write(f"**Seed:** {seed}")
                 st.write(f"**Dimensions:** {width}x{height}")
                 st.write(f"**Device:** {device.upper()}")
+                st.write(f"**Generation Time:** {elapsed:.1f} seconds")
             
             # Clear cache after generation
             if device == "cuda":
                 torch.cuda.empty_cache()
-                gc.collect()
+            gc.collect()
                 
         except RuntimeError as e:
             if "out of memory" in str(e).lower():
                 st.error("""
                 ❌ **Out of Memory Error!**
                 
-                Your GPU ran out of memory. Try these solutions:
-                1. Reduce image size to 512x512
-                2. Reduce inference steps to 20-25
-                3. Use a smaller/faster model (Stable Diffusion v1.4)
-                4. Close other applications using GPU
-                5. Restart the app
+                Try these solutions:
+                1. Reduce inference steps to 15-20
+                2. Use Stable Diffusion v1.4 (smallest model)
+                3. Restart the app
                 """)
-                # Clear CUDA cache
                 if device == "cuda":
                     torch.cuda.empty_cache()
-                    gc.collect()
+                gc.collect()
             else:
                 st.error(f"❌ Error during generation: {str(e)}")
         except Exception as e:
@@ -240,29 +320,80 @@ if generate_button:
 
 # Footer
 st.sidebar.markdown("---")
-st.sidebar.markdown("""
-### About
-This app uses open-source Stable Diffusion models from Hugging Face.
-All processing happens locally on your machine.
+st.sidebar.markdown(f"""
+### Status
+- **Device:** {device.upper()}
+- **Model:** {selected_model_name.split('(')[0].strip()}
 
-**Note:** First run will download the model (~4-7GB) which may take several minutes.
+### About
+This app uses open-source Stable Diffusion models.
+All processing happens on the device shown above.
+
+**Note:** First run downloads the model (~2-4GB).
 """)
 
-# Additional info in main area
-with st.expander("ℹ️ How to use this app"):
+# Additional info
+with st.expander("📖 Complete Usage Guide"):
     st.markdown("""
-    1. **Select a model** in the sidebar (Stable Diffusion v1.5 recommended for 4GB VRAM)
-    2. **Enter your prompt** - be descriptive and specific
-    3. **Adjust parameters** in the sidebar:
-       - More steps = better quality but slower
-       - Guidance scale controls prompt adherence
-       - Seed controls randomness
-    4. **Click Generate** and wait for your image
-    5. **Download** your creation!
+    ### How to Use
     
-    **Performance Tips:**
-    - First generation is slower (model loading)
-    - GPU is ~10-20x faster than CPU
-    - 512x512 images work best on 4GB VRAM
-    - Use 25-30 steps for good quality/speed balance
+    1. **Enter your prompt** - describe what you want to see
+    2. **Adjust parameters** (optional):
+       - Steps: 15-20 for CPU, 25-35 for GPU
+       - Guidance: 7-9 is typical
+       - Seed: for reproducible results
+    3. **Click Generate** and wait
+    4. **Download** your image!
+    
+    ### Performance Guide
+    
+    **On Streamlit Cloud (CPU):**
+    - ⏱️ Very slow: 5-10 minutes per image
+    - 📏 Use 512x512 resolution
+    - 🔢 Use 15-20 steps maximum
+    
+    **On Local Machine with GPU:**
+    - ⚡ Fast: 10-30 seconds per image
+    - 📏 Can use 512x512 or 768x768
+    - 🔢 Use 25-50 steps for quality
+    
+    ### Running Locally
+    
+    To run this on your machine with GPU acceleration:
+    
+    ```bash
+    # Install dependencies
+    pip install -r requirements.txt
+    
+    # Run the app
+    streamlit run app.py
+    ```
+    
+    Your NVIDIA Quadro P1000 will make generation **much faster**!
+    """)
+
+# Download instructions
+with st.expander("💻 Download & Run Locally (Recommended)"):
+    st.markdown("""
+    ### Why Run Locally?
+    - ⚡ **100x faster** with your GPU
+    - 🎨 Better quality settings
+    - 🔒 Complete privacy
+    - 💾 No download limits
+    
+    ### Quick Start
+    
+    1. **Save these files:**
+       - `app.py` (this code)
+       - `requirements.txt`
+    
+    2. **Install & Run:**
+    ```bash
+    pip install -r requirements.txt
+    streamlit run app.py
+    ```
+    
+    3. **Enjoy fast GPU generation!**
+    
+    Your Quadro P1000 will generate images in ~15-30 seconds instead of 5-10 minutes.
     """)
